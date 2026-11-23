@@ -49,6 +49,7 @@ hermes plugins install ghl-command
    - `workflows.readonly`
 4. Save the token. Add it through Hermes secrets as `GHL_API_KEY`.
 5. Add your Location ID as `GHL_LOCATION_ID`. Both secrets are required. Without them the tools stay hidden.
+6. Optional: set `GHL_BUSINESS_NAME`. An email sent without a subject uses it as the subject; without it, an email needs a subject.
 
 In Hermes:
 
@@ -76,7 +77,9 @@ All five steps run from chat. No browser clicking. The two that touch a real per
 - The plugin never reads `.env` files, `auth.json`, or browser stores.
 - Writes require a valid token; without `GHL_API_KEY` and `GHL_LOCATION_ID` the tools stay hidden.
 - There is no default location. The plugin never writes to an account the user did not configure.
-- `ghl_delete_contact`, `ghl_send_sms`, `ghl_send_email` and `ghl_enroll_workflow` go through Hermes' approval prompt before they run, so a note or inbound message in your CRM cannot talk the agent into texting your customers.
+- Every call is held to `GHL_LOCATION_ID`. A `location_id` naming another location is refused, and a contact or opportunity fetched by id must belong to the configured location before it is changed, messaged or enrolled. This matters with agency-level tokens that reach every sub-account.
+- SMS and email sent by phone number or email address look up the existing contact (`GET /contacts/search/duplicate`) and send its `contactId`, which the messages API requires. No match is an error; nothing is created as a side effect.
+- `ghl_delete_contact`, `ghl_send_sms`, `ghl_send_email` and `ghl_enroll_workflow` go through the engine's native approval prompt (a `pre_tool_call` `approve` directive) before they run, so a note or inbound message in your CRM cannot talk the agent into texting your customers. The prompt shows the recipient, the subject and the first 300 characters of the message. Each distinct send gets its own approval rule, so choosing "always" for one message never approves a different one.
 - Model-supplied ids are validated against `[A-Za-z0-9_-]` and percent-escaped before they enter a URL path.
 - The plugin sends network calls only to `services.leadconnectorhq.com`.
 

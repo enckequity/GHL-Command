@@ -69,7 +69,7 @@ def test_registers_pre_tool_call_hook():
     [
         ("ghl_delete_contact", {"contact_id": "abc123"}),
         ("ghl_send_sms", {"contact_id": "abc123", "message": "hi there"}),
-        ("ghl_send_email", {"email": "a@b.com", "subject": "Hello"}),
+        ("ghl_send_email", {"email": "a@b.com", "subject": "Hello", "html": "Hi"}),
         ("ghl_enroll_workflow", {"contact_id": "abc123", "workflow_id": "wf9"}),
     ],
 )
@@ -78,8 +78,8 @@ def test_approval_hook_gates_outbound_tools(tool_name, args):
     verdict = mod.pre_tool_call(tool_name=tool_name, args=args)
     assert isinstance(verdict, dict)
     assert verdict["action"] == "approve"
-    assert verdict["rule_key"] == "ghl-command:" + tool_name
-    assert tool_name in verdict["message"]
+    assert verdict["rule_key"].startswith("ghl-command:" + tool_name + ":")
+    assert verdict["message"]
 
 
 @pytest.mark.parametrize(
