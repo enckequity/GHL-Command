@@ -1,21 +1,29 @@
-"""GHL Command for Hermes Agent.
+"""GHL Command: GoHighLevel tools for an agent.
 
 Native tools for GoHighLevel CRM operations: contacts, pipelines, calendars,
 workflows, email and SMS sends directly from chat.
 
 API host is services.leadconnectorhq.com (the only host that accepts pit-
 Private Integration Tokens) with Version header 2021-07-28. Auth goes
-through Hermes secrets via agent.secret_scope.get_secret, never os.environ
+through the agent's secret scope (agent.secret_scope.get_secret), never os.environ
 directly, so profile multiplexing is respected (catalog rule 11).
 
 There is no baked-in default location. A public plugin must never target the
 author's own account, so both GHL_API_KEY and GHL_LOCATION_ID are required and
 a missing one fails with a clear message instead of writing somewhere the user
-did not choose.
+did not choose. Every call is held to that configured location: a location_id
+argument that names any other location is refused, and a record fetched by id
+must belong to it before it is changed or messaged (an agency-wide token can
+reach every sub-account, so the token alone does not confine it).
+
+Outbound text never names the engine. An email without a subject takes the
+configured business name (GHL_BUSINESS_NAME); with neither, it is refused.
 """
 
 from __future__ import annotations
 
+import hashlib
+import html as html_lib
 import json
 import logging
 import re
@@ -31,9 +39,14 @@ PLUGIN_VERSION = "0.1.0"
 USER_AGENT = "ghl-command/" + PLUGIN_VERSION + " (+https://github.com/PXMichael/GHL-Command)"
 GHL_BASE = "https://services.leadconnectorhq.com"
 LOCATION_HELP = (
-    "GHL_LOCATION_ID is not set. Add your GoHighLevel Location ID via Hermes "
-    "secrets. Find it in the GHL URL bar inside the sub-account."
+    "GHL_LOCATION_ID is not set. Add your GoHighLevel Location ID to the "
+    "assistant's secrets. Find it in the GHL URL bar inside the sub-account."
 )
+SUBJECT_HELP = (
+    "Missing required parameter: subject. Give the email a subject line "
+    "(or set GHL_BUSINESS_NAME so a missing subject uses the business name)."
+)
+PREVIEW_CHARS = 300
 
 
 def tool_error(message: str) -> str:
@@ -41,8 +54,15 @@ def tool_error(message: str) -> str:
     return json.dumps({"error": str(message)}, ensure_ascii=False)
 
 
+def _business_name() -> str:
+    """The business name a subject-less email goes out under, or "" when unset."""
+    from agent.secret_scope import get_secret
+
+    return (get_secret("GHL_BUSINESS_NAME", "") or "").strip()
+
+
 def _get_config() -> tuple[str, str]:
-    """Return (token, location) via Hermes secret scope.
+    """Return (token, location) via the agent's secret scope.
 
     Both values are required. There is no default location, so an unset
     GHL_LOCATION_ID fails loudly rather than targeting an account the user
@@ -50,8 +70,8 @@ def _get_config() -> tuple[str, str]:
     """
     from agent.secret_scope import get_secret
 
-    token = get_secret("GHL_API_KEY", "") or ""
-    location = get_secret("GHL_LOCATION_ID", "") or ""
+    token = (get_secret("GHL_API_KEY", "") or "").strip()
+    location = (get_secret("GHL_LOCATION_ID", "") or "").strip()
     return token, location
 
 
@@ -73,15 +93,21 @@ def _api(
     body: Optional[Any] = None,
     timeout: float = 20,
 ):
-    """One GHL REST call. Raises on HTTP error, returns parsed JSON."""
-    token, default_loc = _get_config()
+    """One GHL REST call. Raises on HTTP error, returns parsed JSON.
+
+    The location is always the configured one; a different location_id raises.
+    """
+    token, configured = _get_config()
     if not token:
         raise RuntimeError(
-            "GHL_API_KEY is not set. Add it via Hermes secrets. " "Private Integration Token (pit-...) is required."
+            "GHL_API_KEY is not set. Add it to the assistant's secrets. "
+            "Private Integration Token (pit-...) is required."
         )
-    loc = location_id or default_loc
-    if not loc:
+    if not configured:
         raise RuntimeError(LOCATION_HELP)
+    if location_id and str(location_id).strip() != configured:
+        raise ValueError(_other_location_message(location_id))
+    loc = configured
     url = GHL_BASE + path
     # Always include locationId as query for list endpoints when not in body
     params = dict(query or {})
@@ -118,9 +144,90 @@ def _api(
         raise RuntimeError(f"GHL network error for {path}: {e.reason}")
 
 
+def _other_location_message(asked: Any) -> str:
+    return (
+        "location_id " + repr(str(asked)[:40]) + " is not the configured GoHighLevel "
+        "location. This connection only works on the location in GHL_LOCATION_ID; "
+        "leave location_id out."
+    )
+
+
+def _asked_location(args: dict) -> str:
+    return str(args.get("location_id") or args.get("locationId") or "").strip()
+
+
 def _resolve_location(args: dict) -> str:
-    token, default_loc = _get_config()
-    return (args.get("location_id") or args.get("locationId") or default_loc or "").strip()
+    """The configured location. A location_id argument may only repeat it."""
+    _token, configured = _get_config()
+    if not configured:
+        raise RuntimeError(LOCATION_HELP)
+    asked = _asked_location(args)
+    if asked and asked != configured:
+        raise ValueError(_other_location_message(asked))
+    return configured
+
+
+def _require_in_location(kind: str, record: Any, loc: str, label: str) -> None:
+    """Refuse a record that is not in the configured location (fail closed)."""
+    found = record.get("locationId") if isinstance(record, dict) else None
+    if found != loc:
+        raise ValueError(
+            kind + " " + repr(label[:40]) + " is not in the configured GoHighLevel "
+            "location, so nothing was changed or sent."
+        )
+
+
+def _contact_in_location(cid: str, raw_id: Any, loc: str) -> Dict[str, Any]:
+    """Fetch a contact by (escaped) id and check it belongs to the configured location."""
+    res = _api("GET", f"/contacts/{cid}", location_id=loc)
+    contact = res.get("contact") if isinstance(res, dict) else None
+    _require_in_location("Contact", contact, loc, str(raw_id))
+    return contact
+
+
+def _find_contact_id(loc: str, phone: str = "", email: str = "") -> str:
+    """Resolve the contactId for a phone number or email in the configured location.
+
+    POST /conversations/messages requires contactId, so a send by phone or email
+    looks the contact up first (GET /contacts/search/duplicate). No match is an
+    error: the contact is created on purpose, not as a side effect of a send.
+    """
+    query = {"locationId": loc}
+    if phone:
+        query["number"] = phone
+        what = "phone " + phone
+    else:
+        query["email"] = email
+        what = "email " + email
+    res = _api("GET", "/contacts/search/duplicate", location_id=loc, query=query)
+    contact = res.get("contact") if isinstance(res, dict) else None
+    if not isinstance(contact, dict) or not contact.get("id"):
+        raise ValueError(
+            "No GoHighLevel contact has " + what + ". Create the contact first "
+            "(ghl_create_contact), then send to its contact_id."
+        )
+    _require_in_location("Contact", contact, loc, str(contact.get("id")))
+    return str(contact["id"])
+
+
+def _email_subject(args: dict) -> str:
+    """The subject the email goes out with: the given one, else the business name, else ""."""
+    subject = str(args.get("subject") or "").strip()
+    return subject or _business_name()
+
+
+def _plain_excerpt(text: Any, limit: int = PREVIEW_CHARS) -> str:
+    """A readable excerpt of an (HTML or plain) body for the approval prompt."""
+    raw = str(text or "")
+    raw = re.sub(r"(?is)<(script|style)\b.*?</\1\s*>", " ", raw)
+    raw = re.sub(r"(?i)<br\s*/?>|</p\s*>|</div\s*>|</li\s*>", "\n", raw)
+    raw = re.sub(r"<[^>]*>", " ", raw)
+    raw = html_lib.unescape(raw)
+    lines = [re.sub(r"[ \t\r\f\v]+", " ", ln).strip() for ln in raw.split("\n")]
+    out = "\n".join(ln for ln in lines if ln)
+    if len(out) > limit:
+        out = out[:limit].rstrip() + "..."
+    return out
 
 
 def _compact_contact(c: Dict[str, Any]) -> Dict[str, Any]:
@@ -160,7 +267,7 @@ def _check_ghl_available() -> bool:
 # These four reach outside the conversation: they delete a record or put a
 # message in front of a real person. A CRM is full of text other people wrote
 # (notes, inbound messages, form answers), so any of it can carry instructions
-# aimed at the model. They run only after Hermes' approval prompt.
+# aimed at the model. They run only after the engine's approval prompt.
 APPROVAL_TOOLS = {
     "ghl_delete_contact",
     "ghl_send_sms",
@@ -186,52 +293,104 @@ def _safe_id(value: Any, field: str) -> str:
     return urllib.parse.quote(text, safe="")
 
 
-def _approval_preview(tool_name: str, args: dict) -> str:
-    """One line naming exactly what is about to happen, for the prompt."""
-    def s(key: str) -> str:
+def _arg(args: dict, *keys: str) -> str:
+    for key in keys:
         v = args.get(key)
-        return str(v) if v not in (None, "") else ""
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
 
+
+def _approval_preview(tool_name: str, args: dict) -> str:
+    """The approval prompt: who, and exactly what they will receive."""
     if tool_name == "ghl_delete_contact":
-        return "delete contact " + (s("contact_id") or s("contactId"))
+        return "Delete GoHighLevel contact " + _arg(args, "contact_id", "contactId") + "? This cannot be undone."
     if tool_name == "ghl_send_sms":
-        who = s("contact_id") or s("contactId") or s("phone") or s("to")
-        return "text " + who + ": " + (s("message") or s("body"))[:120]
+        who = _arg(args, "contact_id", "contactId") or _arg(args, "phone", "to")
+        body = _plain_excerpt(_arg(args, "message", "body"))
+        return "Text " + who + " from GoHighLevel?\n\n" + body
     if tool_name == "ghl_send_email":
-        who = s("contact_id") or s("contactId") or s("email") or s("to")
-        return "email " + who + ": " + (s("subject") or "Message from Hermes")
+        who = _arg(args, "contact_id", "contactId") or _arg(args, "email", "to")
+        body = _plain_excerpt(_arg(args, "html", "htmlBody", "body", "message"))
+        return ("Email " + who + " from GoHighLevel?\nSubject: " + _email_subject(args)
+                + "\n\n" + body)
     if tool_name == "ghl_enroll_workflow":
-        return ("enroll contact " + (s("contact_id") or s("contactId"))
-                + " in workflow " + (s("workflow_id") or s("workflowId")))
+        return ("Enroll GoHighLevel contact " + _arg(args, "contact_id", "contactId")
+                + " in workflow " + _arg(args, "workflow_id", "workflowId")
+                + "? The workflow may message them.")
     return tool_name
 
 
-def pre_tool_call(tool_name: str = "", args=None, **kwargs):
-    """Hold the outbound and destructive calls for a human yes.
+def _approval_rule_key(tool_name: str, args: dict) -> str:
+    """One rule per distinct action, so an "always" never covers a different send.
 
-    Returns None for everything else, so the other eight tools run normally.
+    The key hashes the recipient and the exact content; approving one message
+    "always" only lets that same message to that same recipient through again.
     """
-    if tool_name not in APPROVAL_TOOLS:
+    if tool_name == "ghl_send_sms":
+        parts = [_arg(args, "contact_id", "contactId"), _arg(args, "phone", "to"), _arg(args, "message", "body")]
+    elif tool_name == "ghl_send_email":
+        parts = [_arg(args, "contact_id", "contactId"), _arg(args, "email", "to"), _email_subject(args),
+                 _arg(args, "html", "htmlBody", "body", "message")]
+    elif tool_name == "ghl_delete_contact":
+        parts = [_arg(args, "contact_id", "contactId")]
+    elif tool_name == "ghl_enroll_workflow":
+        parts = [_arg(args, "contact_id", "contactId"), _arg(args, "workflow_id", "workflowId")]
+    else:
+        parts = [json.dumps(args, sort_keys=True, default=str)]
+    digest = hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()[:16]
+    return "ghl-command:" + tool_name + ":" + digest
+
+
+def pre_tool_call(tool_name: str = "", args=None, **kwargs):
+    """Route outbound and destructive calls through the engine's approval gate.
+
+    Returns the native ``{"action": "approve", "message", "rule_key"}`` directive,
+    so the engine's own once/session/always/deny prompt (and whatever approval
+    surface and ledger it reports to) decides. A call that cannot run anyway
+    (another location, an email without a subject) is blocked before anyone is
+    asked. Returns None for everything else.
+    """
+    if not str(tool_name).startswith("ghl_"):
         return None
     args = args if isinstance(args, dict) else {}
+    asked = _asked_location(args)
+    if asked:
+        try:
+            _token, configured = _get_config()
+        except Exception:
+            configured = ""
+        if asked != configured:
+            return {"action": "block", "message": "BLOCKED: nothing was read, changed or sent. "
+                    + _other_location_message(asked)}
+    if tool_name not in APPROVAL_TOOLS:
+        return None
+    try:
+        if tool_name == "ghl_send_email" and not _email_subject(args):
+            return {"action": "block", "message": "BLOCKED: the email was not sent. " + SUBJECT_HELP}
+    except Exception:
+        pass
     try:
         detail = _approval_preview(tool_name, args)
     except Exception:
-        detail = "requested action"
-    return {
-        "action": "approve",
-        "message": tool_name + ": " + detail,
-        "rule_key": "ghl-command:" + tool_name,
-    }
+        detail = "Run " + tool_name + "?"
+    try:
+        rule_key = _approval_rule_key(tool_name, args)
+    except Exception:
+        digest = hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+        rule_key = "ghl-command:" + tool_name + ":" + digest
+    return {"action": "approve", "message": detail, "rule_key": rule_key}
 
 
 
 # --- Handlers ---
+# Each handler resolves the location inside run(), so a refused location_id
+# comes back as a tool error rather than an exception.
 
 def _handle_list_contacts(args: dict, **kw) -> str:
-    loc = _resolve_location(args)
     limit = args.get("limit", 20)
     def run():
+        loc = _resolve_location(args)
         res = _api("GET", "/contacts/", location_id=loc, query={"limit": str(limit), "page": str(args.get("page", 1))})
         contacts = res.get("contacts") or res.get("data") or []
         return {"location_id": loc, "count": len(contacts), "contacts": [_compact_contact(c) for c in contacts], "meta": res.get("meta")}
@@ -239,12 +398,12 @@ def _handle_list_contacts(args: dict, **kw) -> str:
 
 
 def _handle_search_contacts(args: dict, **kw) -> str:
-    loc = _resolve_location(args)
     query = (args.get("query") or args.get("email") or "").strip()
     if not query:
         return tool_error("Missing required parameter: query (email or name)")
     page_limit = args.get("pageLimit") or args.get("limit", 20)
     def run():
+        loc = _resolve_location(args)
         body = {"locationId": loc, "query": query, "pageLimit": int(page_limit)}
         # GHL search supports POST with query and pageLimit
         res = _api("POST", "/contacts/search", location_id=loc, body=body)
@@ -254,15 +413,17 @@ def _handle_search_contacts(args: dict, **kw) -> str:
 
 
 def _handle_create_contact(args: dict, **kw) -> str:
-    loc = _resolve_location(args)
     first = args.get("firstName") or args.get("first_name")
     email = args.get("email")
     phone = args.get("phone")
     if not first and not email and not phone:
         return tool_error("Missing required parameters: firstName, email or phone")
     def run():
+        loc = _resolve_location(args)
         body = {"locationId": loc}
-        for key in ["firstName", "lastName", "email", "phone", "tags", "companyName", "address", "source"]:
+        if first:
+            body["firstName"] = first
+        for key in ["lastName", "email", "phone", "tags", "companyName", "address", "source"]:
             if args.get(key):
                 body[key] = args[key]
         # Accept tags as string or list
@@ -279,6 +440,7 @@ def _handle_update_contact(args: dict, **kw) -> str:
     if not contact_id:
         return tool_error("Missing required parameter: contact_id")
     def run():
+        loc = _resolve_location(args)
         body = {}
         for key in ["firstName", "lastName", "email", "phone", "tags", "companyName", "address"]:
             if args.get(key) is not None:
@@ -287,8 +449,9 @@ def _handle_update_contact(args: dict, **kw) -> str:
             body["tags"] = [t.strip() for t in body["tags"].split(",") if t.strip()]
         if not body:
             return {"error": "No fields to update", "contact_id": contact_id}
-        # IMPORTANT: contact update must NOT include locationId (returns 422)
         cid = _safe_id(contact_id, "contact_id")
+        _contact_in_location(cid, contact_id, loc)
+        # IMPORTANT: contact update must NOT include locationId (returns 422)
         res = _api("PUT", f"/contacts/{cid}", body=body)
         contact = res.get("contact") or res
         return {"contact_id": contact_id, "contact": _compact_contact(contact) if isinstance(contact, dict) else contact}
@@ -299,55 +462,65 @@ def _handle_delete_contact(args: dict, **kw) -> str:
     contact_id = args.get("contact_id") or args.get("contactId")
     if not contact_id:
         return tool_error("Missing required parameter: contact_id")
-    loc = _resolve_location(args)
     def run():
+        loc = _resolve_location(args)
         cid = _safe_id(contact_id, "contact_id")
+        _contact_in_location(cid, contact_id, loc)
         res = _api("DELETE", f"/contacts/{cid}", location_id=loc)
         return {"contact_id": contact_id, "location_id": loc, "result": res}
     return _dispatch(run, "ghl_delete_contact", "Failed to delete contact")
 
 
+def _send_target(loc: str, contact_id: Any, phone: str = "", email: str = "") -> str:
+    """The contactId a message goes to: a given id checked against the location, else looked up."""
+    if contact_id:
+        cid = _safe_id(contact_id, "contact_id")
+        _contact_in_location(cid, contact_id, loc)
+        return str(contact_id).strip()
+    return _find_contact_id(loc, phone=phone, email=email)
+
+
 def _handle_send_sms(args: dict, **kw) -> str:
     contact_id = args.get("contact_id") or args.get("contactId")
     message = args.get("message") or args.get("body")
-    phone = args.get("phone") or args.get("to")
+    phone = str(args.get("phone") or args.get("to") or "").strip()
     if not message:
         return tool_error("Missing required parameter: message")
     if not contact_id and not phone:
         return tool_error("Missing required parameter: contact_id or phone")
-    loc = _resolve_location(args)
     def run():
-        body = {"locationId": loc, "contactId": contact_id, "type": "SMS", "message": message}
-        if phone and not contact_id:
-            body["phone"] = phone
-        # GHL conversations/messages POST
+        loc = _resolve_location(args)
+        cid = _send_target(loc, contact_id, phone=phone)
+        body = {"locationId": loc, "contactId": cid, "type": "SMS", "message": message}
+        # GHL conversations/messages POST (contactId is required)
         res = _api("POST", "/conversations/messages", location_id=loc, body=body)
-        return {"location_id": loc, "contact_id": contact_id, "phone": phone, "message_id": res.get("id") or res.get("messageId"), "raw": res}
+        return {"location_id": loc, "contact_id": cid, "phone": phone or None, "message_id": res.get("messageId") or res.get("id"), "raw": res}
     return _dispatch(run, "ghl_send_sms", "Failed to send SMS")
 
 
 def _handle_send_email(args: dict, **kw) -> str:
     contact_id = args.get("contact_id") or args.get("contactId")
-    email = args.get("email") or args.get("to")
-    subject = args.get("subject") or "Message from Hermes"
+    email = str(args.get("email") or args.get("to") or "").strip()
     html = args.get("html") or args.get("htmlBody") or args.get("body") or args.get("message")
     if not html:
         return tool_error("Missing required parameter: html (email body)")
     if not contact_id and not email:
         return tool_error("Missing required parameter: contact_id or email")
-    loc = _resolve_location(args)
     def run():
-        body = {"locationId": loc, "contactId": contact_id, "type": "Email", "subject": subject, "htmlBody": html}
-        if email and not contact_id:
-            body["email"] = email
+        subject = _email_subject(args)
+        if not subject:
+            raise ValueError(SUBJECT_HELP)
+        loc = _resolve_location(args)
+        cid = _send_target(loc, contact_id, email=email)
+        body = {"locationId": loc, "contactId": cid, "type": "Email", "subject": subject, "html": html}
         res = _api("POST", "/conversations/messages", location_id=loc, body=body)
-        return {"location_id": loc, "contact_id": contact_id, "email": email, "subject": subject, "message_id": res.get("id") or res.get("messageId"), "raw": res}
+        return {"location_id": loc, "contact_id": cid, "email": email or None, "subject": subject, "message_id": res.get("messageId") or res.get("id"), "raw": res}
     return _dispatch(run, "ghl_send_email", "Failed to send email")
 
 
 def _handle_list_pipelines(args: dict, **kw) -> str:
-    loc = _resolve_location(args)
     def run():
+        loc = _resolve_location(args)
         res = _api("GET", "/opportunities/pipelines", location_id=loc)
         pipelines = res.get("pipelines") or res.get("data") or res
         # Normalize pipeline summaries
@@ -362,9 +535,10 @@ def _handle_list_pipelines(args: dict, **kw) -> str:
 
 
 def _handle_search_opportunities(args: dict, **kw) -> str:
-    loc = _resolve_location(args)
     def run():
-        query = {"locationId": loc, "limit": str(args.get("limit", 20))}
+        loc = _resolve_location(args)
+        # GET /opportunities/search takes snake_case location_id
+        query = {"location_id": loc, "limit": str(args.get("limit", 20))}
         if args.get("pipeline_id"):
             query["pipeline_id"] = args["pipeline_id"]
         if args.get("contact_id"):
@@ -380,25 +554,28 @@ def _handle_move_opportunity(args: dict, **kw) -> str:
     if not opp_id:
         return tool_error("Missing required parameter: opportunity_id")
     def run():
+        loc = _resolve_location(args)
         body = {}
-        # Accept stage_id or status
+        # Accept stage_id or status; the API field is pipelineStageId
         if args.get("stage_id"):
-            body["stageId"] = args["stage_id"]
+            body["pipelineStageId"] = args["stage_id"]
         if args.get("stage"):
-            body["stageId"] = args["stage"]
+            body["pipelineStageId"] = args["stage"]
         if args.get("status"):
             body["status"] = args["status"]
         if not body:
             return {"error": "Provide stage_id or status", "opportunity_id": opp_id}
         oid = _safe_id(opp_id, "opportunity_id")
+        current = _api("GET", f"/opportunities/{oid}", location_id=loc)
+        _require_in_location("Opportunity", current.get("opportunity") if isinstance(current, dict) else None, loc, str(opp_id))
         res = _api("PUT", f"/opportunities/{oid}", body=body)
         return {"opportunity_id": opp_id, "result": res}
     return _dispatch(run, "ghl_move_opportunity", "Failed to move opportunity")
 
 
 def _handle_list_workflows(args: dict, **kw) -> str:
-    loc = _resolve_location(args)
     def run():
+        loc = _resolve_location(args)
         res = _api("GET", "/workflows/", location_id=loc)
         workflows = res.get("workflows") or res.get("data") or res
         if isinstance(workflows, list):
@@ -415,9 +592,11 @@ def _handle_enroll_workflow(args: dict, **kw) -> str:
     if not contact_id or not workflow_id:
         return tool_error("Missing required parameters: contact_id and workflow_id")
     def run():
+        loc = _resolve_location(args)
         # Exact singular endpoint: POST /contacts/{contactId}/workflow/{workflowId} with {}
         cid = _safe_id(contact_id, "contact_id")
         wid = _safe_id(workflow_id, "workflow_id")
+        _contact_in_location(cid, contact_id, loc)
         res = _api("POST", f"/contacts/{cid}/workflow/{wid}", body={})
         return {"contact_id": contact_id, "workflow_id": workflow_id, "result": res}
     return _dispatch(run, "ghl_enroll_workflow", "Failed to enroll in workflow")
@@ -431,7 +610,6 @@ GHL_LIST_CONTACTS_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "location_id": {"type": "string", "description": "Optional location ID. Defaults to GHL_LOCATION_ID from Hermes secrets."},
             "limit": {"type": "integer", "description": "How many to return. Default 20."},
             "page": {"type": "integer", "description": "Page number. Default 1."},
         },
@@ -446,7 +624,6 @@ GHL_SEARCH_CONTACTS_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Email or name to search for."},
-            "location_id": {"type": "string", "description": "Optional location ID."},
             "pageLimit": {"type": "integer", "description": "How many to return. Default 20."},
         },
         "required": ["query"],
@@ -455,7 +632,7 @@ GHL_SEARCH_CONTACTS_SCHEMA = {
 
 GHL_CREATE_CONTACT_SCHEMA = {
     "name": "ghl_create_contact",
-    "description": "Create a GoHighLevel contact. Include locationId plus firstName, email or phone.",
+    "description": "Create a GoHighLevel contact. Provide firstName, email or phone.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -465,7 +642,6 @@ GHL_CREATE_CONTACT_SCHEMA = {
             "phone": {"type": "string"},
             "tags": {"type": "string", "description": "Comma separated tags."},
             "companyName": {"type": "string"},
-            "location_id": {"type": "string"},
         },
         "required": [],
     },
@@ -496,7 +672,6 @@ GHL_DELETE_CONTACT_SCHEMA = {
         "type": "object",
         "properties": {
             "contact_id": {"type": "string"},
-            "location_id": {"type": "string"},
         },
         "required": ["contact_id"],
     },
@@ -504,14 +679,13 @@ GHL_DELETE_CONTACT_SCHEMA = {
 
 GHL_SEND_SMS_SCHEMA = {
     "name": "ghl_send_sms",
-    "description": "Send an SMS via GoHighLevel conversations. Provide contact_id or phone plus message.",
+    "description": "Send an SMS via GoHighLevel conversations. Provide contact_id, or the phone number of an existing contact, plus message. Asks the person for approval first.",
     "parameters": {
         "type": "object",
         "properties": {
             "contact_id": {"type": "string"},
             "phone": {"type": "string"},
             "message": {"type": "string"},
-            "location_id": {"type": "string"},
         },
         "required": ["message"],
     },
@@ -519,15 +693,14 @@ GHL_SEND_SMS_SCHEMA = {
 
 GHL_SEND_EMAIL_SCHEMA = {
     "name": "ghl_send_email",
-    "description": "Send an email via GoHighLevel conversations. Provide contact_id or email plus html body.",
+    "description": "Send an email via GoHighLevel conversations. Provide contact_id, or the email of an existing contact, plus subject and html body. Asks the person for approval first.",
     "parameters": {
         "type": "object",
         "properties": {
             "contact_id": {"type": "string"},
             "email": {"type": "string"},
-            "subject": {"type": "string"},
+            "subject": {"type": "string", "description": "Subject line. Defaults to the business name when one is configured."},
             "html": {"type": "string", "description": "HTML email body or plain text."},
-            "location_id": {"type": "string"},
         },
         "required": ["html"],
     },
@@ -539,7 +712,6 @@ GHL_LIST_PIPELINES_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "location_id": {"type": "string"},
         },
         "required": [],
     },
@@ -551,7 +723,6 @@ GHL_SEARCH_OPPORTUNITIES_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "location_id": {"type": "string"},
             "pipeline_id": {"type": "string"},
             "contact_id": {"type": "string"},
             "limit": {"type": "integer"},
@@ -562,7 +733,7 @@ GHL_SEARCH_OPPORTUNITIES_SCHEMA = {
 
 GHL_MOVE_OPPORTUNITY_SCHEMA = {
     "name": "ghl_move_opportunity",
-    "description": "Move an opportunity to a new pipeline stage. Provide opportunity_id plus stage_id.",
+    "description": "Move an opportunity to a new pipeline stage. Provide opportunity_id plus stage_id (a pipeline stage id) or status.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -580,7 +751,6 @@ GHL_LIST_WORKFLOWS_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "location_id": {"type": "string"},
         },
         "required": [],
     },

@@ -5,7 +5,7 @@ version: "0.1.0"
 author: PXMichael
 homepage: https://github.com/PXMichael/ghl-command
 license: MIT
-description: "GoHighLevel lives inside Hermes. Create contacts, move deals, send email and SMS, trigger workflows from chat. Live in 90 seconds, no browser clicks."
+description: "GoHighLevel from chat. Create contacts, move deals, send email and SMS, trigger workflows. Sends and deletes ask for approval first."
 requires_hermes: ">=0.19"
 platforms: []
 provides_tools:
@@ -31,4 +31,9 @@ requires_env:
   - name: GHL_LOCATION_ID
     description: "Your GoHighLevel Location ID. Find it in the GHL URL bar inside the sub-account."
     prompt: "GoHighLevel Location ID"
+    password: false
+optional_env:
+  - name: GHL_BUSINESS_NAME
+    description: "Business name used as the email subject when none is given. Without it, an email needs a subject."
+    prompt: "Business name for email subjects"
     password: false
